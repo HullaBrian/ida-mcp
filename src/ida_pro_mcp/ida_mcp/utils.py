@@ -338,6 +338,18 @@ class NumberConversion(TypedDict, total=False):
     size: Annotated[int, "Byte size for conversion (omit for auto)"]
 
 
+class FloatConversion(TypedDict, total=False):
+    """IEEE-754 float conversion request"""
+
+    value: Annotated[
+        str,
+        "Hex string (e.g. '0x3f800000') for hex→float, or float string (e.g. '1.0') for float→hex",
+    ]
+    precision: Annotated[
+        str, "Precision: 'single' (32-bit) or 'double' (64-bit), default 'single'"
+    ]
+
+
 class StructRead(TypedDict, total=False):
     """Structure read request
 

@@ -243,6 +243,7 @@ def test_tool_param_typed_dicts_have_required_core():
         "DefineOp",
         "UndefineOp",
         "NumberConversion",
+        "FloatConversion",
         "EnumUpsert",
         "EnumMemberUpsert",
     }

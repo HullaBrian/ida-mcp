@@ -20,6 +20,7 @@ from ..utils import Function, ConvertedNumber
 from ..api_core import (
     lookup_funcs,
     int_convert,
+    list_tools,
     list_funcs,
     func_query,
     list_globals,
@@ -199,6 +200,51 @@ def test_int_convert_non_ascii():
     assert_is_list(result, min_length=1)
     assert_ok(result[0], "result")
     assert result[0]["result"]["ascii"] is None
+
+
+@test()
+def test_list_tools_returns_all_tools():
+    """list_tools returns at least the known core tools with required fields."""
+    result = list_tools()
+    assert_is_list(result, min_length=5)
+    assert_shape(
+        result,
+        list_of(
+            {
+                "name": str,
+                "description": str,
+                "parameters": list,
+                "unsafe": bool,
+            }
+        ),
+    )
+    names = {t["name"] for t in result}
+    assert "list_tools" in names, "list_tools should list itself"
+    assert "server_health" in names
+
+
+@test()
+def test_list_tools_filter():
+    """list_tools with a glob filter returns only matching tools."""
+    result = list_tools("list_*")
+    assert_is_list(result, min_length=1)
+    for entry in result:
+        assert entry["name"].startswith("list_"), entry["name"]
+
+
+@test()
+def test_list_tools_parameters_shape():
+    """list_tools includes parameter metadata for a tool that has required params."""
+    result = list_tools("lookup_funcs")
+    assert_is_list(result, min_length=1)
+    assert len(result) == 1, f"Expected exactly 1 result, got {len(result)}"
+    entry = result[0]
+    assert entry["name"] == "lookup_funcs"
+    params = entry["parameters"]
+    assert isinstance(params, list) and len(params) >= 1
+    for p in params:
+        assert isinstance(p.get("name"), str)
+        assert isinstance(p.get("required"), bool)
 
 
 @test()

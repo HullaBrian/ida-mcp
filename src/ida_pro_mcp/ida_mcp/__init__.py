@@ -39,6 +39,7 @@ from . import api_composite
 from . import api_discovery
 from . import trace as trace
 from . import api_sigmaker
+from . import api_capa
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
@@ -69,6 +70,7 @@ __all__ = [
     "api_composite",
     "api_discovery",
     "api_sigmaker",
+    "api_capa",
     # Re-exported components
     "idasync",
     "IDAError",

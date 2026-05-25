@@ -1,9 +1,13 @@
 """Core API Functions - IDB metadata and basic queries"""
 
+import ast
+import fnmatch
 import logging
+import operator as _op
 import re
+import struct
 import time
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated, Any, NotRequired, Optional, TypedDict
 
 import ida_auto
 import ida_bytes
@@ -19,11 +23,12 @@ import ida_nalt
 import ida_typeinf
 import idc
 
-from .rpc import tool
+from .rpc import tool, MCP_SERVER, MCP_UNSAFE
 from .sync import idasync
 from .utils import (
     ConvertedNumber,
     EntityQuery,
+    FloatConversion,
     Function,
     FunctionQuery,
     Global,
@@ -80,6 +85,44 @@ class IntConvertResult(TypedDict):
     input: str
     result: ConvertedNumber | None
     error: str | None
+
+
+class EvalExprResult(TypedDict):
+    expr: str
+    result: str | None
+    decimal: str | None
+    hexadecimal: str | None
+    float_value: Optional[float]
+    error: str | None
+
+
+class IEEE754Breakdown(TypedDict):
+    float_value: float
+    hexadecimal: str
+    binary: str
+    sign: int
+    biased_exponent: int
+    mantissa_bits: str
+    precision: str
+
+
+class FloatConvertResult(TypedDict):
+    input: str
+    result: Optional[IEEE754Breakdown]
+    error: str | None
+
+
+class ToolParamInfo(TypedDict):
+    name: str
+    description: str
+    required: bool
+
+
+class ToolListing(TypedDict):
+    name: str
+    description: str
+    parameters: list[ToolParamInfo]
+    unsafe: bool
 
 
 class FunctionQueryRow(Function, total=False):
@@ -474,6 +517,49 @@ def lookup_funcs(
 
 
 @tool
+def list_tools(
+    filter: Annotated[
+        str,
+        "Optional glob pattern to filter tool names (e.g. 'list_*', '*func*'). Empty string returns all tools.",
+    ] = "",
+) -> list[ToolListing]:
+    """List all available MCP tools with their descriptions, parameters, and safety flags.
+
+    Returns every registered tool — including this one. Each entry includes:
+    - name: the tool name to call
+    - description: what the tool does
+    - parameters: name, description, and required flag for each input parameter
+    - unsafe: true if the tool requires --unsafe mode to be enabled
+    """
+    raw = MCP_SERVER._mcp_tools_list()
+    results: list[ToolListing] = []
+    for entry in raw.get("tools", []):
+        name = entry.get("name", "")
+        if filter and not fnmatch.fnmatch(name, filter):
+            continue
+        schema = entry.get("inputSchema", {})
+        props = schema.get("properties", {})
+        required_set = set(schema.get("required", []))
+        params: list[ToolParamInfo] = [
+            ToolParamInfo(
+                name=param_name,
+                description=param_schema.get("description", ""),
+                required=param_name in required_set,
+            )
+            for param_name, param_schema in props.items()
+        ]
+        results.append(
+            ToolListing(
+                name=name,
+                description=entry.get("description", ""),
+                parameters=params,
+                unsafe=name in MCP_UNSAFE,
+            )
+        )
+    return results
+
+
+@tool
 def int_convert(
     inputs: Annotated[
         list[NumberConversion] | NumberConversion,
@@ -538,6 +624,186 @@ def int_convert(
                 "error": None,
             }
         )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Safe expression evaluator (no IDA dependency, no @idasync needed)
+# ---------------------------------------------------------------------------
+
+_BINOP_MAP: dict = {
+    ast.Add: _op.add,
+    ast.Sub: _op.sub,
+    ast.Mult: _op.mul,
+    ast.Div: _op.truediv,
+    ast.FloorDiv: _op.floordiv,
+    ast.Mod: _op.mod,
+    ast.Pow: _op.pow,
+    ast.BitXor: _op.xor,
+    ast.BitAnd: _op.and_,
+    ast.BitOr: _op.or_,
+    ast.LShift: _op.lshift,
+    ast.RShift: _op.rshift,
+}
+
+_UNOP_MAP: dict = {
+    ast.USub: _op.neg,
+    ast.UAdd: _op.pos,
+    ast.Invert: _op.invert,
+}
+
+_MAX_POW_EXPONENT = 1000
+
+
+def _safe_eval_node(node: ast.AST) -> int | float:
+    if isinstance(node, ast.Expression):
+        return _safe_eval_node(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError(f"Unsupported literal: {node.value!r}")
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval_node(node.left)
+        right = _safe_eval_node(node.right)
+        fn = _BINOP_MAP.get(type(node.op))
+        if fn is None:
+            raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_POW_EXPONENT:
+            raise ValueError(f"Exponent {right} exceeds limit {_MAX_POW_EXPONENT}")
+        return fn(left, right)
+    if isinstance(node, ast.UnaryOp):
+        fn = _UNOP_MAP.get(type(node.op))
+        if fn is None:
+            raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+        return fn(_safe_eval_node(node.operand))
+    raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+
+
+@tool
+def eval_expr(
+    exprs: Annotated[
+        list[str] | str,
+        "Mathematical expression(s) to evaluate. Supports integer literals (including hex 0x...), floats, and operators: +, -, *, /, //, %, **, &, |, ^, ~, <<, >>",
+    ],
+) -> list[EvalExprResult]:
+    """Evaluate mathematical expressions. Returns results with decimal, hex, and float representations."""
+    if isinstance(exprs, str):
+        exprs = [exprs]
+
+    results = []
+    for expr in exprs:
+        try:
+            tree = ast.parse(expr.strip(), mode="eval")
+            value = _safe_eval_node(tree)
+            if isinstance(value, int):
+                results.append(
+                    EvalExprResult(
+                        expr=expr,
+                        result=str(value),
+                        decimal=str(value),
+                        hexadecimal=hex(value),
+                        float_value=float(value),
+                        error=None,
+                    )
+                )
+            else:
+                results.append(
+                    EvalExprResult(
+                        expr=expr,
+                        result=repr(value),
+                        decimal=None,
+                        hexadecimal=None,
+                        float_value=float(value),
+                        error=None,
+                    )
+                )
+        except Exception as exc:
+            results.append(
+                EvalExprResult(
+                    expr=expr,
+                    result=None,
+                    decimal=None,
+                    hexadecimal=None,
+                    float_value=None,
+                    error=str(exc),
+                )
+            )
+    return results
+
+
+@tool
+def float_convert(
+    inputs: Annotated[
+        list[FloatConversion] | FloatConversion,
+        "Convert between hex and IEEE-754 floating point. Pass a hex string (e.g. '0x3f800000') to decode, or a float string (e.g. '1.0') to encode. Use 'precision' to select 'single' (32-bit, default) or 'double' (64-bit).",
+    ],
+) -> list[FloatConvertResult]:
+    """Convert between hex representations and IEEE-754 single/double precision floats."""
+    inputs = normalize_dict_list(inputs, lambda s: {"value": s})
+
+    results = []
+    for item in inputs:
+        value_str = item.get("value", "")
+        precision = item.get("precision", "single").lower()
+
+        try:
+            if precision not in ("single", "double"):
+                raise ValueError(
+                    f"precision must be 'single' or 'double', got {precision!r}"
+                )
+
+            is_single = precision == "single"
+            byte_count = 4 if is_single else 8
+            fmt = ">f" if is_single else ">d"
+
+            stripped = value_str.strip()
+            if stripped.lower().startswith("0x"):
+                raw_int = int(stripped, 16)
+                try:
+                    raw_bytes = raw_int.to_bytes(byte_count, "big")
+                except OverflowError:
+                    raise ValueError(
+                        f"{stripped} is too large for {precision} precision ({byte_count} bytes)"
+                    )
+                float_val = struct.unpack(fmt, raw_bytes)[0]
+                hex_str = f"0x{raw_int:0{byte_count * 2}x}"
+            else:
+                float_val = float(stripped)
+                raw_bytes = struct.pack(fmt, float_val)
+                raw_int = int.from_bytes(raw_bytes, "big")
+                hex_str = f"0x{raw_int:0{byte_count * 2}x}"
+
+            if is_single:
+                sign = (raw_int >> 31) & 1
+                biased_exp = (raw_int >> 23) & 0xFF
+                mantissa = raw_int & 0x7FFFFF
+                exp_bits, mant_bits = 8, 23
+            else:
+                sign = (raw_int >> 63) & 1
+                biased_exp = (raw_int >> 52) & 0x7FF
+                mantissa = raw_int & 0x000FFFFFFFFFFFFF
+                exp_bits, mant_bits = 11, 52
+
+            results.append(
+                FloatConvertResult(
+                    input=value_str,
+                    result=IEEE754Breakdown(
+                        float_value=float_val,
+                        hexadecimal=hex_str,
+                        binary=f"0b{sign:01b}_{biased_exp:0{exp_bits}b}_{mantissa:0{mant_bits}b}",
+                        sign=sign,
+                        biased_exponent=biased_exp,
+                        mantissa_bits=f"{mantissa:0{mant_bits}b}",
+                        precision=precision,
+                    ),
+                    error=None,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                FloatConvertResult(input=value_str, result=None, error=str(exc))
+            )
 
     return results
 
