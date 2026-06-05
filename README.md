@@ -22,7 +22,7 @@ The binaries and prompt for the video are available in the [mcp-reversing-datase
   - [Crush](https://github.com/charmbracelet/crush)
   - [Cursor](https://cursor.com)
   - [Gemini CLI](https://google-gemini.github.io/gemini-cli/)
-  - [Kilo Code](https://www.kilocode.com/)
+  - [Kilo Code](https://kilo.ai/)
   - [Kiro](https://kiro.dev/)
   - [LM Studio](https://lmstudio.ai/)
   - [Opencode](https://opencode.ai/)
@@ -177,6 +177,18 @@ For stdio-based clients, use:
 ```sh
 uv run idalib-mcp --stdio
 ```
+
+`--stdio` keeps database state inside that MCP server process. For stdio clients
+that spawn separate MCP server processes, such as Codex sub-agents, use
+`--stdio-shared` instead:
+
+```sh
+uv run idalib-mcp --stdio-shared
+```
+
+`--stdio-shared` starts or reuses a shared local HTTP supervisor on the
+configured host/port and proxies stdio JSON-RPC to it, so separate stdio MCP
+processes can share the same opened database workers.
 
 _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
